@@ -1,3 +1,24 @@
+# Image Name Quiz — Arianna Method fork
+
+> **Arianna Method fork.** This fork adds `engine/` — a fully local, pure-C vision-language
+> inference engine built on [notorch](https://github.com/ariannamethod/notorch), running
+> **SmolVLM-256M** (`HuggingFaceTB/SmolVLM-256M-Instruct`) with no cloud and no API. The
+> upstream quiz is already fully local (the answer is the image filename); this fork is
+> about adding *local* visual understanding on top of it, in C, on our own runtime.
+>
+> **What changed:** a new `engine/` directory — vendored notorch + `smolvlm.c` + a GPT-2
+> byte-level BPE with special-token support. The original app is left untouched.
+>
+> **Status — phase 1 (text decoder):** the SmolLM2-135M text decoder runs on the real
+> SmolVLM-256M GGUF in pure C; greedy output matches llama.cpp token-for-token and the
+> tokenizer matches `llama-tokenize`. Next: the SigLIP vision tower, the pixel-shuffle
+> connector, and full image→text. Model weights are not committed (fetched from
+> `ggml-org/SmolVLM-256M-Instruct-GGUF`).
+>
+> The original project README follows.
+
+---
+
 # Image Name Quiz
 
 **A smart study tool to help you connect names to faces (or labels to diagrams).**
