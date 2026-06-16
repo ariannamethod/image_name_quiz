@@ -1,0 +1,15 @@
+# model weights — never commit (downloaded via hf)
+models/
+*.gguf
+
+# build artifacts
+*.o
+smolvlm
+infer_llama
+*.dSYM/
+
+# captured reference / scratch
+ref/*.txt
+
+# local dev log (kept local, not published)
+PROJECT_LOG.md
