@@ -37,4 +37,15 @@ int siglip_hidden(const siglip_model* m);
  * post-layernorm hidden states. Returns 0 on success. */
 int siglip_encode(const siglip_model* m, const float* frame, float* out);
 
+/* ── pixel-shuffle connector (PHASE 4) ──────────────────────────────────────
+ * idefics3 pixel-shuffle (scale 4): [n_patches=1024, hidden=768] -> [64, 12288]
+ * (4x4 spatial-neighborhood merge) then Linear mm.model.fc [text_dim, 12288]
+ * (no bias, no activation) -> [n_vis_tokens=64, text_dim=576] visual embeddings
+ * already in the text decoder's hidden dim, ready to splice at <image> tokens. */
+int siglip_n_vis_tokens(const siglip_model* m);   /* 64 */
+int siglip_text_dim(const siglip_model* m);        /* 576 */
+
+/* hidden[n_patches*hidden] (siglip_encode output) -> out[n_vis_tokens*text_dim]. 0 on ok. */
+int siglip_connect(const siglip_model* m, const float* hidden, float* out);
+
 #endif /* VISION_H */

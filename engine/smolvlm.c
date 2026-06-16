@@ -282,7 +282,18 @@ int main(int argc, char **argv) {
             printf("  vision hidden states = [%d, %d]  (frame 0 of %d)\n", P, D, nf);
             printf("  NaN=%ld  min=%.4f  max=%.4f  mean=%.5f  token0_mean=%.5f\n", nan, mn, mx, sum / n, tok0);
             printf("  checksum=%.6f  (determinism: must be identical across runs)\n", csum);
-            free(h); free(fr); siglip_free(vm);
+            /* PHASE 4: pixel-shuffle connector -> visual embeddings in text dim */
+            int NV = siglip_n_vis_tokens(vm), TD = siglip_text_dim(vm);
+            float *vemb = (float*)malloc((long)NV * TD * sizeof(float));
+            if (vemb && siglip_connect(vm, h, vemb) == 0) {
+                long vn = (long)NV * TD, vnan = 0; float vmn = vemb[0], vmx = vemb[0]; double vsum = 0, vcs = 0;
+                for (long t = 0; t < vn; t++) { float x = vemb[t];
+                    if (x != x) vnan++; if (x < vmn) vmn = x; if (x > vmx) vmx = x; vsum += x; vcs += (double)x * (t % 97 + 1); }
+                printf("  connector: visual embeddings = [%d, %d]  NaN=%ld min=%.4f max=%.4f mean=%.5f\n",
+                       NV, TD, vnan, vmn, vmx, vsum / vn);
+                printf("  connector checksum=%.6f\n", vcs);
+            } else { fprintf(stderr, "siglip_connect failed\n"); return 1; }
+            free(vemb); free(h); free(fr); siglip_free(vm);
             return 0;
         }
     }

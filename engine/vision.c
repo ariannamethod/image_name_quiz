@@ -144,10 +144,12 @@ static void softmax_row(float* x, int n) {
 
 struct siglip_model {
     int n_layers, hidden, n_heads, head_dim, ffn, patches, patch, img;
+    int scale, text_dim;           /* pixel-shuffle scale (4), projector out dim (576) */
     float eps;
     float *patch_w, *patch_b;      /* [hidden, 3*patch*patch], [hidden] */
     float *pos_w;                  /* [patches, hidden] */
     float *post_ln_w, *post_ln_b;  /* [hidden] */
+    float *fc_w;                   /* mm.model.fc.weight [text_dim, hidden*scale^2] (no bias) */
     struct {
         float *ln1_w,*ln1_b,*ln2_w,*ln2_b;
         float *q_w,*q_b,*k_w,*k_b,*v_w,*v_b,*o_w,*o_b;
@@ -183,6 +185,8 @@ siglip_model* siglip_load(const char* mmproj_path) {
     m->patch    = kv_u32(gf, "clip.vision.patch_size", 16);
     m->eps      = kv_f32(gf, "clip.vision.attention.layer_norm_epsilon", 1e-6f);
     m->head_dim = m->hidden / m->n_heads;
+    m->scale    = kv_u32(gf, "clip.vision.projector.scale_factor", 4);
+    m->text_dim = kv_u32(gf, "clip.vision.projection_dim", 576);
     int grid    = m->img / m->patch;
     m->patches  = grid * grid;
 
@@ -194,6 +198,7 @@ siglip_model* siglip_load(const char* mmproj_path) {
     m->pos_w   = gd(gf, "v.position_embd.weight");
     m->post_ln_w = gd(gf, "v.post_ln.weight");
     m->post_ln_b = gd(gf, "v.post_ln.bias");
+    m->fc_w      = gd(gf, "mm.model.fc.weight");   /* connector projector */
 
     m->L = (typeof(m->L))calloc(m->n_layers, sizeof(*m->L));
     char nm[128];
@@ -211,7 +216,7 @@ siglip_model* siglip_load(const char* mmproj_path) {
     }
     gguf_close(gf);   /* dequant copied to float; raw gguf no longer needed */
 
-    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !m->L[0].q_w) {
+    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !m->L[0].q_w || !m->fc_w) {
         fprintf(stderr, "siglip: missing critical vision weights\n");
         siglip_free(m); return NULL;
     }
@@ -220,7 +225,7 @@ siglip_model* siglip_load(const char* mmproj_path) {
 
 void siglip_free(siglip_model* m) {
     if (!m) return;
-    free(m->patch_w); free(m->patch_b); free(m->pos_w); free(m->post_ln_w); free(m->post_ln_b);
+    free(m->patch_w); free(m->patch_b); free(m->pos_w); free(m->post_ln_w); free(m->post_ln_b); free(m->fc_w);
     if (m->L) for (int l = 0; l < m->n_layers; l++) {
         free(m->L[l].ln1_w); free(m->L[l].ln1_b); free(m->L[l].ln2_w); free(m->L[l].ln2_b);
         free(m->L[l].q_w); free(m->L[l].q_b); free(m->L[l].k_w); free(m->L[l].k_b);
@@ -312,5 +317,42 @@ int siglip_encode(const siglip_model* m, const float* frame, float* out) {
     layernorm_rows(out, m->post_ln_w, m->post_ln_b, P, D, m->eps);
 
     free(tmp);free(q);free(k);free(v);free(att);free(proj);free(up);free(qh);free(kh_);free(vh);free(sc);free(oh);
+    return 0;
+}
+
+/* ── pixel-shuffle connector (PHASE 4) ──────────────────────────────────────
+ * Index map verified vs clip.cpp build_patch_merge_permute (oracle):
+ *   patches row-major p = h*grid + w (w inner). scale s=4, grid 32 -> 8x8=64 tokens.
+ *   output token o = hg*(grid/s) + wg     (hg outer, wg inner)
+ *   channel D = hin*(s*hidden) + win*hidden + c   (slot k = hin*s+win; hin outer, win inner)
+ *   pulls from patch (h = hg*s+hin, w = wg*s+win), channel c.
+ * Then projector mm.model.fc [text_dim, hidden*s^2], no bias, no activation. */
+int siglip_n_vis_tokens(const siglip_model* m) {
+    if (!m) return 0;
+    int g = (m->img / m->patch) / m->scale;
+    return g * g;
+}
+int siglip_text_dim(const siglip_model* m) { return m ? m->text_dim : 0; }
+
+int siglip_connect(const siglip_model* m, const float* hidden, float* out) {
+    int D = m->hidden, grid = m->img / m->patch, s = m->scale;
+    int g = grid / s;                 /* 8 */
+    int n_vis = g * g;                /* 64 */
+    int vis_dim = D * s * s;          /* 12288 */
+    float* sh = (float*)malloc((long)n_vis * vis_dim * sizeof(float));
+    if (!sh) return -1;
+    for (int hg = 0; hg < g; hg++)
+        for (int wg = 0; wg < g; wg++) {
+            int o = hg * g + wg;                       /* token col: hg outer, wg inner */
+            for (int hin = 0; hin < s; hin++)
+                for (int win = 0; win < s; win++) {
+                    int k = hin * s + win;             /* block slot: hin outer, win inner */
+                    int src = (hg * s + hin) * grid + (wg * s + win);   /* patch p = h*grid+w */
+                    memcpy(sh + (long)o * vis_dim + (long)k * D,
+                           hidden + (long)src * D, D * sizeof(float));
+                }
+        }
+    mmT(out, sh, m->fc_w, n_vis, vis_dim, m->text_dim);   /* [64, text_dim] = sh @ fc^T */
+    free(sh);
     return 0;
 }
