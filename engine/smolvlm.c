@@ -16,6 +16,7 @@
 #include "gguf.h"
 #include "notorch.h"
 #include "bpe.h"
+#include "vision.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -242,6 +243,50 @@ int main(int argc, char **argv) {
         printf("  --prompt byte-level fallback (NOT real BPE — for quick smoke only)\n");
         return 1;
     }
+    // PHASE 2: image preprocessing test (idefics3 tiling + normalize) — no model needed
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--vision-test") && i + 1 < argc) {
+            const char *ip = argv[i + 1];
+            int nf = 0, S = 0;
+            float *fr = smolvlm_preprocess(ip, &nf, &S);
+            if (!fr) { fprintf(stderr, "preprocess failed: %s\n", ip); return 1; }
+            long n = (long)nf * 3 * S * S;
+            float mn = fr[0], mx = fr[0]; double sum = 0;
+            for (long k = 0; k < n; k++) { float v = fr[k]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+            printf("vision-test: %s\n", ip);
+            printf("  n_frames=%d  S=%d  shape/frame=[3,%d,%d]  total floats=%ld\n", nf, S, S, S, n);
+            printf("  value range: min=%.4f max=%.4f mean=%.4f  (expect [-1,1], mean~0)\n", mn, mx, sum / n);
+            printf("  image tokens (64/frame) = %d\n", nf * 64);
+            free(fr);
+            return 0;
+        }
+    }
+
+    // PHASE 3: SigLIP vision-tower test — usage: smolvlm --siglip-test <image> <mmproj.gguf>
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--siglip-test") && i + 2 < argc) {
+            const char *ip = argv[i + 1], *mmp = argv[i + 2];
+            siglip_model *vm = siglip_load(mmp);
+            if (!vm) { fprintf(stderr, "siglip_load failed: %s\n", mmp); return 1; }
+            int nf = 0, S = 0;
+            float *fr = smolvlm_preprocess(ip, &nf, &S);
+            if (!fr) { fprintf(stderr, "preprocess failed: %s\n", ip); return 1; }
+            int P = siglip_n_patches(vm), D = siglip_hidden(vm);
+            float *h = (float*)malloc((long)P * D * sizeof(float));
+            if (!h || siglip_encode(vm, fr, h) != 0) { fprintf(stderr, "siglip_encode failed\n"); return 1; }
+            long n = (long)P * D, nan = 0; float mn = h[0], mx = h[0]; double sum = 0, csum = 0;
+            for (long t = 0; t < n; t++) { float x = h[t];
+                if (x != x) nan++; if (x < mn) mn = x; if (x > mx) mx = x; sum += x; csum += (double)x * (t % 97 + 1); }
+            double tok0 = 0; for (int j = 0; j < D; j++) tok0 += h[j]; tok0 /= D;
+            printf("siglip-test: image=%s mmproj=%s\n", ip, mmp);
+            printf("  vision hidden states = [%d, %d]  (frame 0 of %d)\n", P, D, nf);
+            printf("  NaN=%ld  min=%.4f  max=%.4f  mean=%.5f  token0_mean=%.5f\n", nan, mn, mx, sum / n, tok0);
+            printf("  checksum=%.6f  (determinism: must be identical across runs)\n", csum);
+            free(h); free(fr); siglip_free(vm);
+            return 0;
+        }
+    }
+
     const char *model_path = argv[1];
     const char *ids_str = NULL, *prompt = NULL, *text = NULL;
     int max_tokens = 16;

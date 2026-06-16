@@ -13,3 +13,5 @@ ref/*.txt
 
 # local dev log (kept local, not published)
 PROJECT_LOG.md
+smolvlm_asan
+*.dSYM/
