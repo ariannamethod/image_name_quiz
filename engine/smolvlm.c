@@ -154,14 +154,16 @@ static kv_cache* kv_new(int nl, int max_seq, int kv_dim) {
     return kv;
 }
 
-static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, float* logits) {
+static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, float* logits,
+                          const float* emb_override) {
     int E = m->embed, H = m->n_heads, KV = m->n_kv_heads;
     int HD = m->head_dim, KVD = m->kv_dim, FFN = m->ffn, Q_DIM = m->q_dim;
     float eps = m->rms_eps; int gqa = H / KV;
 
     float *x = (float*)calloc(E, sizeof(float));
-    // ── SPLICE POINT (vision phase: image-placeholder tokens get connector embeds here) ──
-    memcpy(x, m->tok_emb + (long)token * E, E * sizeof(float));
+    // ── SPLICE POINT: image-placeholder positions get connector vision embeddings ──
+    if (emb_override) memcpy(x, emb_override, E * sizeof(float));
+    else              memcpy(x, m->tok_emb + (long)token * E, E * sizeof(float));
 
     float *xn = (float*)calloc(E, sizeof(float));
     float *q_all = (float*)calloc(Q_DIM, sizeof(float));
@@ -299,12 +301,14 @@ int main(int argc, char **argv) {
     }
 
     const char *model_path = argv[1];
-    const char *ids_str = NULL, *prompt = NULL, *text = NULL;
+    const char *ids_str = NULL, *prompt = NULL, *text = NULL, *image_path = NULL, *mmproj_path = NULL;
     int max_tokens = 16;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i+1 < argc) ids_str = argv[++i];
         else if (!strcmp(argv[i], "--text") && i+1 < argc) text = argv[++i];
-        else if (!strcmp(argv[i], "--prompt") && i+1 < argc) prompt = argv[++i];
+        else if ((!strcmp(argv[i], "--prompt") || !strcmp(argv[i], "-p")) && i+1 < argc) prompt = argv[++i];
+        else if (!strcmp(argv[i], "--image") && i+1 < argc) image_path = argv[++i];
+        else if (!strcmp(argv[i], "--mmproj") && i+1 < argc) mmproj_path = argv[++i];
         else if (!strcmp(argv[i], "-n") && i+1 < argc) max_tokens = atoi(argv[++i]);
     }
 
@@ -317,6 +321,61 @@ int main(int argc, char **argv) {
     bpe_tokenizer *bpe = bpe_load(model_path);
     if (bpe) printf("bpe: %d tokens loaded\n", bpe_n_vocab(bpe));
     else printf("bpe: load failed (id/byte modes only)\n");
+
+    // ── PHASE 5: image -> text (vision tower + connector + splice, end-to-end) ──
+    if (image_path && mmproj_path && bpe) {
+        siglip_model *vm = siglip_load(mmproj_path);
+        if (!vm) { fprintf(stderr, "mmproj load failed: %s\n", mmproj_path); return 1; }
+        int nf = 0, S = 0;
+        float *fr = smolvlm_preprocess(image_path, &nf, &S);
+        if (!fr) { fprintf(stderr, "preprocess failed: %s\n", image_path); return 1; }
+        int P = siglip_n_patches(vm), NV = siglip_n_vis_tokens(vm), TD = siglip_text_dim(vm);
+        float *hid  = (float*)malloc((long)P * siglip_hidden(vm) * sizeof(float));
+        float *vemb = (float*)malloc((long)NV * TD * sizeof(float));
+        if (!hid || !vemb || siglip_encode(vm, fr, hid) != 0 || siglip_connect(vm, hid, vemb) != 0) {
+            fprintf(stderr, "vision encode/connect failed\n"); return 1; }
+        free(hid); free(fr);
+        if (TD != model->embed) { fprintf(stderr, "dim mismatch vis=%d text=%d\n", TD, model->embed); return 1; }
+
+        // prompt: <|im_start|>User:<fake><global-img>(<image> x NV)<fake>{instr}<end_of_utterance>\nAssistant:
+        const char *instr = prompt ? prompt : "Describe this image in one sentence.";
+        char *buf = (char*)malloc((long)NV * 8 + strlen(instr) + 256);
+        // idefics3 single-image (no split), 84-token layout matching llama-mtmd-cli:
+        // <|im_start|>User:\n<fake><global-img>(<image> x NV)<fake>\n{instr}<end_of_utterance>\nAssistant:
+        int off = sprintf(buf, "<|im_start|>User:\n<fake_token_around_image><global-img>");
+        for (int j = 0; j < NV; j++) off += sprintf(buf + off, "<image>");
+        sprintf(buf + off, "<fake_token_around_image>\n%s<end_of_utterance>\nAssistant:", instr);
+
+        int img_max = 64, MS = 1024;
+        int *toks = (int*)calloc(MS, sizeof(int));
+        int n_tok = bpe_encode(bpe, buf, toks, MS - img_max);
+        free(buf);
+        printf("image=%s  prompt=%d tok (vis=%d)\n", image_path, n_tok, NV);
+
+        kv_cache *kv = kv_new(model->n_layers, MS, model->kv_dim);
+        float *logits = (float*)calloc(model->vocab, sizeof(float));
+        int vis_slot = 0;
+        for (int i = 0; i < n_tok; i++) {
+            const float *ov = NULL;
+            if (toks[i] == 49190 && vis_slot < NV) ov = vemb + (long)(vis_slot++) * TD;  // splice
+            llama_forward(model, kv, toks[i], i, logits, ov);
+        }
+        char piece[256];
+        printf("OURS: \"");
+        for (int step = 0; step < img_max; step++) {
+            int next = argmax(logits, model->vocab);
+            if (next == 2 || next == 49279) break;   // eos / <end_of_utterance>
+            piece[0] = 0; bpe_decode_token(bpe, next, piece, sizeof(piece));
+            printf("%s", piece); fflush(stdout);
+            int pos = n_tok + step;
+            if (pos >= MS - 1) break;
+            llama_forward(model, kv, next, pos, logits, NULL);
+        }
+        printf("\"\n");
+        free(vemb); free(toks); free(logits); siglip_free(vm);
+        bpe_free(bpe); gguf_close(gf);
+        return 0;
+    }
 
     // build prompt token ids
     int max_seq = 1024;
@@ -342,7 +401,7 @@ int main(int argc, char **argv) {
     float *logits = (float*)calloc(model->vocab, sizeof(float));
 
     double t0 = now_ms();
-    for (int i = 0; i < n_tok; i++) llama_forward(model, kv, tokens[i], i, logits);
+    for (int i = 0; i < n_tok; i++) llama_forward(model, kv, tokens[i], i, logits, NULL);
 
     printf("\n-- greedy decode (%d tokens) --\n", max_tokens);
     char piece[256], out_text[4096]; out_text[0] = 0; int out_len = 0;
@@ -356,7 +415,7 @@ int main(int argc, char **argv) {
         if (out_len + pl < (int)sizeof(out_text) - 1) { strcpy(out_text + out_len, piece); out_len += pl; }
         int pos = n_tok + step;
         if (pos >= max_seq - 1) break;
-        llama_forward(model, kv, next, pos, logits);
+        llama_forward(model, kv, next, pos, logits, NULL);
     }
     printf("\ngenerated: \"%s\"\n", out_text);
     printf("-- %.0f ms --\n", now_ms() - t0);

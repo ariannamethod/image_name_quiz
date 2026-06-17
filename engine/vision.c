@@ -131,10 +131,19 @@ static void layernorm_rows(float* x, const float* g, const float* b, int m, int 
         for (int j = 0; j < n; j++) r[j] = ((r[j]-(float)mu)*inv)*g[j] + b[j];
     }
 }
-/* gelu_pytorch_tanh (exact tanh formula; ggml CPU uses an f16 LUT -> ~1e-3 rel drift) */
+/* gelu_pytorch_tanh, matching ggml's GGML_GELU_FP16 path bit-for-bit: clamp on
+ * f32 input, else round input to f16, exact tanh-gelu, round result to f16.
+ * (llama.cpp clip uses this f16-LUT; exact-f32 gelu diverged ~1e-3 -> greedy flips.) */
 static void gelu_tanh_inplace(float* x, long n) {
     const float c = 0.79788456080286535588f, a = 0.044715f;
-    for (long i = 0; i < n; i++) { float v = x[i]; x[i] = 0.5f*v*(1.0f + tanhf(c*(v + a*v*v*v))); }
+    for (long i = 0; i < n; i++) {
+        float v = x[i];
+        if (v <= -10.0f) { x[i] = 0.0f; continue; }   /* ggml clamp */
+        if (v >=  10.0f) { x[i] = v;    continue; }    /* ggml clamp (gelu(x)~x) */
+        float xr = (float)(__fp16)v;                   /* LUT index: input rounded to f16 */
+        float g  = 0.5f*xr*(1.0f + tanhf(c*(xr + a*xr*xr*xr)));
+        x[i] = (float)(__fp16)g;                       /* LUT stores result as f16 */
+    }
 }
 static void softmax_row(float* x, int n) {
     float mx = x[0]; for (int i = 1; i < n; i++) if (x[i] > mx) mx = x[i];
