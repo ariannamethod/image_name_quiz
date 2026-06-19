@@ -1,0 +1,6 @@
+# build artifact
+quizgame
+*.dSYM/
+
+# generated at runtime / by the engine (caption cache)
+captions.json
