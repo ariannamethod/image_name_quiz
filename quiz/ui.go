@@ -4,6 +4,7 @@ package main
 
 import (
 	"image/color"
+	"strings"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/text"
@@ -106,6 +107,25 @@ func drawImageFit(screen, img *ebiten.Image, x, y, w, h float64) (dx, dy, dw, dh
 	op.Filter = ebiten.FilterLinear
 	screen.DrawImage(img, op)
 	return dx, dy, dw, dh
+}
+
+// wrapText greedily word-wraps s so each line fits within maxW pixels.
+func wrapText(face font.Face, s string, maxW float64) []string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return nil
+	}
+	var lines []string
+	cur := words[0]
+	for _, w := range words[1:] {
+		if float64(textWidth(face, cur+" "+w)) <= maxW {
+			cur += " " + w
+		} else {
+			lines = append(lines, cur)
+			cur = w
+		}
+	}
+	return append(lines, cur)
 }
 
 func min3(a, b, c float64) float64 {
