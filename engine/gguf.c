@@ -31,6 +31,7 @@ static int read_string(FILE* f, char* buf, int max) {
 }
 
 static int skip_value(FILE* f, uint32_t type);
+static float f16_to_f32(uint16_t h);   /* defined below, used by gguf_load_f16 helpers */
 
 static int skip_array(FILE* f) {
     uint32_t atype;
@@ -229,6 +230,27 @@ char** gguf_read_str_array(const char* path, const char* key, int* out_n) {
     }
     fclose(f);
     return result;
+}
+
+// Load an F16 tensor as raw uint16_t (exact, half the RAM of gguf_dequant->f32).
+// Returns NULL if the tensor is NOT F16 (caller keeps those as f32 via gguf_dequant)
+// or on bounds error. Caller frees.
+uint16_t* gguf_load_f16(const gguf_file* gf, int tensor_idx) {
+    if (!gf || tensor_idx < 0 || tensor_idx >= (int)gf->n_tensors) return NULL;
+    const gguf_tensor_info* ti = &gf->tensors[tensor_idx];
+    if (ti->dtype != GGUF_TYPE_F16) return NULL;
+    if (ti->n_elements > gf->data_size / 2) return NULL;   /* overflow / malformed guard */
+    uint64_t nbytes = ti->n_elements * 2;
+    if (ti->offset >= gf->data_size || nbytes > gf->data_size - ti->offset) return NULL;
+    uint16_t* dst = (uint16_t*)malloc(nbytes);
+    if (!dst) return NULL;
+    memcpy(dst, gf->data + ti->offset, nbytes);
+    return dst;
+}
+
+// Batch f16 -> f32 (dequant-to-scratch at matmul time).
+void gguf_f16_to_f32_n(const uint16_t* src, float* dst, long n) {
+    for (long i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
 }
 
 // Read a GGUF int32/uint32 array (e.g. tokenizer.ggml.token_type) by key.

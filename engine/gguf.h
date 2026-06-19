@@ -88,6 +88,14 @@ int gguf_find_tensor(const gguf_file* gf, const char* name);
 // Handles: F32 (copy), F16 (convert), Q8_0 (dequant), Q4_0 (dequant).
 float* gguf_dequant(const gguf_file* gf, int tensor_idx);
 
+// Load tensor as f16 (uint16_t) — half the RAM of gguf_dequant. Raw copy if the
+// tensor is already F16; otherwise dequant to f32 then round to f16. Caller frees.
+// Used for matmul weights (lazy-dequant to a scratch f32 buffer at matmul time).
+uint16_t* gguf_load_f16(const gguf_file* gf, int tensor_idx);
+
+// Batch f16 -> f32 (for dequant-to-scratch in the matmul). dst must hold n floats.
+void gguf_f16_to_f32_n(const uint16_t* src, float* dst, long n);
+
 // Get metadata value by key. Returns NULL if not found.
 const gguf_kv* gguf_get_kv(const gguf_file* gf, const char* key);
 

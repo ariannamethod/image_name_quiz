@@ -48,6 +48,59 @@ static void mm_t(float *C, const float *A, const float *B, int m, int k, int n) 
 #endif
 }
 
+/* ── f16 weights (half RAM): each matmul weight is f16 (exact GGUF value) or f32.
+ *    Lazy-dequant f16 -> reused f32 scratch right before cblas (portable BLAS). ── */
+static inline float f16_to_f32_smol(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF, r;
+    if (exp == 0) {
+        if (mant == 0) { r = sign; }
+        else { exp = 127 - 15 + 1; while (!(mant & 0x400)) { mant <<= 1; exp--; }
+               mant &= 0x3FF; r = sign | (exp << 23) | (mant << 13); }
+    } else if (exp == 0x1F) { r = sign | 0x7F800000 | (mant << 13); }
+    else { r = sign | ((exp + 127 - 15) << 23) | (mant << 13); }
+    float f; memcpy(&f, &r, 4); return f;
+}
+typedef struct { const uint16_t *f16; const float *f32; } wt;   /* exactly one set */
+
+static wt load_wt(gguf_file *gf, const char *name) {
+    wt w = {NULL, NULL};
+    int ti = gguf_find_tensor(gf, name);
+    if (ti < 0) return w;
+    w.f16 = gguf_load_f16(gf, ti);          /* non-NULL iff tensor is F16 */
+    if (!w.f16) w.f32 = gguf_dequant(gf, ti);
+    return w;
+}
+static int wt_ok(wt w) { return w.f16 || w.f32; }
+
+static float *g_wscratch = NULL; static long g_wscap = 0;
+static const float *materialize(wt w, long n) {        /* -> f32 view (scratch if f16) */
+    if (w.f32) return w.f32;
+    if (!w.f16) return NULL;
+    if (n > g_wscap) { free(g_wscratch); g_wscratch = (float*)malloc(n * sizeof(float));
+                       g_wscap = g_wscratch ? n : 0; }   /* cap only on success -> retry works */
+    if (!g_wscratch) return NULL;                        /* OOM: no NULL write */
+    gguf_f16_to_f32_n(w.f16, g_wscratch, n);
+    return g_wscratch;
+}
+
+static void mm_t(float *C, const float *A, const float *B, int m, int k, int n);  /* fwd */
+/* C[m,n] = A[m,k] @ W[n,k]^T with a wt weight (lazy-dequant) */
+static void mm_t_w(float *C, const float *A, wt W, int m, int k, int n) {
+    mm_t(C, A, materialize(W, (long)n * k), m, k, n);
+}
+/* lm_head matvec: logits[v] = sum_k x[k]*W[v,k], W f16-or-f32, no big scratch (per-element) */
+static void lmhead(wt W, const float *x, float *logits, int vocab, int E) {
+    if (W.f32) { mm_t(logits, x, W.f32, 1, E, vocab); return; }
+    const uint16_t *w = W.f16;
+    for (int v = 0; v < vocab; v++) {
+        const uint16_t *row = w + (long)v * E;
+        float s = 0;
+        for (int k = 0; k < E; k++) s += x[k] * f16_to_f32_smol(row[k]);
+        logits[v] = s;
+    }
+}
+
 static void rmsnorm(float *out, const float *x, const float *w, int n, float eps) {
     float ss = 0;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -86,11 +139,14 @@ typedef struct {
     float rope_base, rms_eps;
     int has_output_weight;
 
-    float *tok_emb, *out_norm, *out_weight;
+    wt tok_emb, out_weight;        /* f16-or-f32 */
+    float *out_norm;
     struct {
-        float *attn_norm, *wq, *wk, *wv, *wo;
+        float *attn_norm;
+        wt wq, wk, wv, wo;         /* f16-or-f32 */
         float *q_bias, *k_bias, *v_bias;
-        float *ffn_norm, *wgate, *wup, *wdown;
+        float *ffn_norm;
+        wt wgate, wup, wdown;      /* f16-or-f32 */
     } layers[];
 } llama_model;
 
@@ -120,24 +176,26 @@ static llama_model* llama_load(gguf_file* gf) {
            m->embed, m->n_heads, m->n_kv_heads, m->ffn, m->vocab, nl, m->head_dim, m->q_dim,
            m->rope_base, m->rms_eps);
 
-    ti = gguf_find_tensor(gf, "token_embd.weight");  if (ti >= 0) m->tok_emb = gguf_dequant(gf, ti);
+    m->tok_emb = load_wt(gf, "token_embd.weight");
     ti = gguf_find_tensor(gf, "output_norm.weight");  if (ti >= 0) m->out_norm = gguf_dequant(gf, ti);
-    ti = gguf_find_tensor(gf, "output.weight");
-    if (ti >= 0) { m->out_weight = gguf_dequant(gf, ti); m->has_output_weight = 1; }
+    m->out_weight = load_wt(gf, "output.weight");
+    m->has_output_weight = wt_ok(m->out_weight);
 
     for (int l = 0; l < nl; l++) {
         char name[128];
         #define L(field, fmt) do { snprintf(name, sizeof(name), fmt, l); \
             ti = gguf_find_tensor(gf, name); if (ti >= 0) m->layers[l].field = gguf_dequant(gf, ti); } while(0)
+        #define LW(field, fmt) do { snprintf(name, sizeof(name), fmt, l); m->layers[l].field = load_wt(gf, name); } while(0)
         L(attn_norm, "blk.%d.attn_norm.weight");
-        L(wq, "blk.%d.attn_q.weight"); L(wk, "blk.%d.attn_k.weight");
-        L(wv, "blk.%d.attn_v.weight"); L(wo, "blk.%d.attn_output.weight");
+        LW(wq, "blk.%d.attn_q.weight"); LW(wk, "blk.%d.attn_k.weight");
+        LW(wv, "blk.%d.attn_v.weight"); LW(wo, "blk.%d.attn_output.weight");
         L(q_bias, "blk.%d.attn_q.bias"); L(k_bias, "blk.%d.attn_k.bias"); L(v_bias, "blk.%d.attn_v.bias");
         L(ffn_norm, "blk.%d.ffn_norm.weight");
-        L(wgate, "blk.%d.ffn_gate.weight"); L(wup, "blk.%d.ffn_up.weight"); L(wdown, "blk.%d.ffn_down.weight");
+        LW(wgate, "blk.%d.ffn_gate.weight"); LW(wup, "blk.%d.ffn_up.weight"); LW(wdown, "blk.%d.ffn_down.weight");
         #undef L
+        #undef LW
     }
-    if (!m->tok_emb || !m->out_norm) { fprintf(stderr, "smolvlm: missing critical weights\n"); return NULL; }
+    if (!wt_ok(m->tok_emb) || !m->out_norm) { fprintf(stderr, "smolvlm: missing critical weights\n"); return NULL; }
     if (!m->has_output_weight) printf("  (tied embeddings)\n");
     return m;
 }
@@ -163,7 +221,9 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
     float *x = (float*)calloc(E, sizeof(float));
     // ── SPLICE POINT: image-placeholder positions get connector vision embeddings ──
     if (emb_override) memcpy(x, emb_override, E * sizeof(float));
-    else              memcpy(x, m->tok_emb + (long)token * E, E * sizeof(float));
+    else if (m->tok_emb.f32) memcpy(x, m->tok_emb.f32 + (long)token * E, E * sizeof(float));
+    else { const uint16_t *r = m->tok_emb.f16 + (long)token * E;   /* dequant one row */
+           for (int i = 0; i < E; i++) x[i] = f16_to_f32_smol(r[i]); }
 
     float *xn = (float*)calloc(E, sizeof(float));
     float *q_all = (float*)calloc(Q_DIM, sizeof(float));
@@ -176,9 +236,9 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
 
     for (int l = 0; l < m->n_layers; l++) {
         rmsnorm(xn, x, m->layers[l].attn_norm, E, eps);
-        mm_t(q_all, xn, m->layers[l].wq, 1, E, Q_DIM);
-        mm_t(k_new, xn, m->layers[l].wk, 1, E, KVD);
-        mm_t(v_new, xn, m->layers[l].wv, 1, E, KVD);
+        mm_t_w(q_all, xn, m->layers[l].wq, 1, E, Q_DIM);
+        mm_t_w(k_new, xn, m->layers[l].wk, 1, E, KVD);
+        mm_t_w(v_new, xn, m->layers[l].wv, 1, E, KVD);
         add_bias(q_all, m->layers[l].q_bias, Q_DIM);
         add_bias(k_new, m->layers[l].k_bias, KVD);
         add_bias(v_new, m->layers[l].v_bias, KVD);
@@ -209,20 +269,19 @@ static void llama_forward(llama_model* m, kv_cache* kv, int token, int pos, floa
             free(scores);
         }
         float *proj = (float*)calloc(E, sizeof(float));
-        mm_t(proj, attn_out, m->layers[l].wo, 1, Q_DIM, E);
+        mm_t_w(proj, attn_out, m->layers[l].wo, 1, Q_DIM, E);
         for (int i = 0; i < E; i++) x[i] += proj[i];
         free(proj);
 
         rmsnorm(xn, x, m->layers[l].ffn_norm, E, eps);
-        mm_t(ffn_gate, xn, m->layers[l].wgate, 1, E, FFN);
-        mm_t(ffn_up, xn, m->layers[l].wup, 1, E, FFN);
+        mm_t_w(ffn_gate, xn, m->layers[l].wgate, 1, E, FFN);
+        mm_t_w(ffn_up, xn, m->layers[l].wup, 1, E, FFN);
         for (int i = 0; i < FFN; i++) { float g = ffn_gate[i]; ffn_gate[i] = (g / (1.0f + expf(-g))) * ffn_up[i]; }
-        mm_t(ffn_out, ffn_gate, m->layers[l].wdown, 1, FFN, E);
+        mm_t_w(ffn_out, ffn_gate, m->layers[l].wdown, 1, FFN, E);
         for (int i = 0; i < E; i++) x[i] += ffn_out[i];
     }
     rmsnorm(xn, x, m->out_norm, E, eps);
-    float *lm_head = m->has_output_weight ? m->out_weight : m->tok_emb;
-    mm_t(logits, xn, lm_head, 1, E, m->vocab);
+    lmhead(m->has_output_weight ? m->out_weight : m->tok_emb, xn, logits, m->vocab, E);
 
     free(x); free(xn); free(q_all); free(k_new); free(v_new);
     free(attn_out); free(ffn_gate); free(ffn_up); free(ffn_out);
@@ -315,7 +374,8 @@ int main(int argc, char **argv) {
     gguf_file* gf = gguf_open(model_path);
     if (!gf) return 1;
     llama_model* model = llama_load(gf);
-    if (!model) { gguf_close(gf); return 1; }
+    gguf_close(gf); gf = NULL;   // weights copied into model (f16/f32); free ~313MB raw GGUF data now
+    if (!model) return 1;
 
     // GPT-2 byte-level BPE over the GGUF tokenizer (notorch examples/bpe.c, vendored)
     bpe_tokenizer *bpe = bpe_load(model_path);
@@ -373,7 +433,7 @@ int main(int argc, char **argv) {
         }
         printf("\"\n");
         free(vemb); free(toks); free(logits); siglip_free(vm);
-        bpe_free(bpe); gguf_close(gf);
+        bpe_free(bpe);   // gf already closed after llama_load
         return 0;
     }
 
@@ -422,6 +482,6 @@ int main(int argc, char **argv) {
 
     free(logits); free(tokens);
     if (bpe) bpe_free(bpe);
-    gguf_close(gf);
+    // gf already closed after llama_load
     return 0;
 }

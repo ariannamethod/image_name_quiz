@@ -117,6 +117,39 @@ static void mm(float* C, const float* A, const float* B, int m, int k, int n) {
         float s = 0; for (int p = 0; p < k; p++) s += A[(long)i*k+p] * B[(long)p*n+j]; C[(long)i*n+j] = s; }
 #endif
 }
+
+/* ── f16 weights (half RAM): a matmul weight is kept as f16 (exact GGUF value) or
+ *    f32. Lazy-dequant f16 -> a reused f32 scratch right before the portable cblas.
+ *    gguf_f16_to_f32_n is bit-identical to gguf_dequant's F16 path, so the f32 view
+ *    equals the previous gd() weight exactly -> vision output is unchanged. ── */
+typedef struct { const uint16_t *f16; const float *f32; } wt;   /* exactly one set */
+
+static wt load_wt(gguf_file *gf, const char *name) {
+    wt w = {NULL, NULL};
+    int ti = gguf_find_tensor(gf, name);
+    if (ti < 0) return w;
+    w.f16 = gguf_load_f16(gf, ti);          /* non-NULL iff tensor is F16 */
+    if (!w.f16) w.f32 = gguf_dequant(gf, ti);   /* genuinely-f32 weights stay f32 */
+    return w;
+}
+static int  wt_ok(wt w)   { return w.f16 || w.f32; }
+static void wt_free(wt w) { free((void*)w.f16); free((void*)w.f32); }
+
+static float *g_vscratch = NULL; static long g_vscap = 0;
+static const float *materialize(wt w, long n) {     /* -> f32 view (reused scratch if f16) */
+    if (w.f32) return w.f32;
+    if (!w.f16) return NULL;
+    if (n > g_vscap) { free(g_vscratch); g_vscratch = (float*)malloc(n * sizeof(float));
+                       g_vscap = g_vscratch ? n : 0; }   /* cap only on success -> retry works */
+    if (!g_vscratch) return NULL;                        /* OOM: no NULL write */
+    gguf_f16_to_f32_n(w.f16, g_vscratch, n);
+    return g_vscratch;
+}
+/* C[m,n] = A[m,k] @ W[n,k]^T with a wt weight (lazy-dequant), via mmT. */
+static void mmT_w(float* C, const float* A, wt W, int m, int k, int n) {
+    mmT(C, A, materialize(W, (long)n * k), m, k, n);
+}
+
 static void add_bias_rows(float* x, const float* b, int m, int n) {
     if (!b) return;
     for (int i = 0; i < m; i++) { float* r = x + (long)i*n; for (int j = 0; j < n; j++) r[j] += b[j]; }
@@ -158,11 +191,13 @@ struct siglip_model {
     float *patch_w, *patch_b;      /* [hidden, 3*patch*patch], [hidden] */
     float *pos_w;                  /* [patches, hidden] */
     float *post_ln_w, *post_ln_b;  /* [hidden] */
-    float *fc_w;                   /* mm.model.fc.weight [text_dim, hidden*scale^2] (no bias) */
+    wt fc_w;                       /* mm.model.fc.weight [text_dim, hidden*scale^2] f16 (no bias) */
     struct {
         float *ln1_w,*ln1_b,*ln2_w,*ln2_b;
-        float *q_w,*q_b,*k_w,*k_b,*v_w,*v_b,*o_w,*o_b;
-        float *up_w,*up_b,*dn_w,*dn_b;
+        wt q_w, k_w, v_w, o_w;     /* attn matmul weights (f16 in GGUF) */
+        float *q_b,*k_b,*v_b,*o_b;
+        wt up_w, dn_w;             /* ffn matmul weights (f16 in GGUF) */
+        float *up_b,*dn_b;
     } *L;
 };
 
@@ -207,25 +242,27 @@ siglip_model* siglip_load(const char* mmproj_path) {
     m->pos_w   = gd(gf, "v.position_embd.weight");
     m->post_ln_w = gd(gf, "v.post_ln.weight");
     m->post_ln_b = gd(gf, "v.post_ln.bias");
-    m->fc_w      = gd(gf, "mm.model.fc.weight");   /* connector projector */
+    m->fc_w      = load_wt(gf, "mm.model.fc.weight");   /* connector projector (f16) */
 
     m->L = (typeof(m->L))calloc(m->n_layers, sizeof(*m->L));
     char nm[128];
     for (int l = 0; l < m->n_layers; l++) {
         #define LD(field, fmt) do { snprintf(nm,sizeof(nm),fmt,l); m->L[l].field = gd(gf, nm); } while(0)
+        #define LW(field, fmt) do { snprintf(nm,sizeof(nm),fmt,l); m->L[l].field = load_wt(gf, nm); } while(0)
         LD(ln1_w,"v.blk.%d.ln1.weight"); LD(ln1_b,"v.blk.%d.ln1.bias");
         LD(ln2_w,"v.blk.%d.ln2.weight"); LD(ln2_b,"v.blk.%d.ln2.bias");
-        LD(q_w,"v.blk.%d.attn_q.weight"); LD(q_b,"v.blk.%d.attn_q.bias");
-        LD(k_w,"v.blk.%d.attn_k.weight"); LD(k_b,"v.blk.%d.attn_k.bias");
-        LD(v_w,"v.blk.%d.attn_v.weight"); LD(v_b,"v.blk.%d.attn_v.bias");
-        LD(o_w,"v.blk.%d.attn_out.weight"); LD(o_b,"v.blk.%d.attn_out.bias");
-        LD(up_w,"v.blk.%d.ffn_up.weight"); LD(up_b,"v.blk.%d.ffn_up.bias");
-        LD(dn_w,"v.blk.%d.ffn_down.weight"); LD(dn_b,"v.blk.%d.ffn_down.bias");
+        LW(q_w,"v.blk.%d.attn_q.weight"); LD(q_b,"v.blk.%d.attn_q.bias");
+        LW(k_w,"v.blk.%d.attn_k.weight"); LD(k_b,"v.blk.%d.attn_k.bias");
+        LW(v_w,"v.blk.%d.attn_v.weight"); LD(v_b,"v.blk.%d.attn_v.bias");
+        LW(o_w,"v.blk.%d.attn_out.weight"); LD(o_b,"v.blk.%d.attn_out.bias");
+        LW(up_w,"v.blk.%d.ffn_up.weight"); LD(up_b,"v.blk.%d.ffn_up.bias");
+        LW(dn_w,"v.blk.%d.ffn_down.weight"); LD(dn_b,"v.blk.%d.ffn_down.bias");
         #undef LD
+        #undef LW
     }
     gguf_close(gf);   /* dequant copied to float; raw gguf no longer needed */
 
-    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !m->L[0].q_w || !m->fc_w) {
+    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !wt_ok(m->L[0].q_w) || !wt_ok(m->fc_w)) {
         fprintf(stderr, "siglip: missing critical vision weights\n");
         siglip_free(m); return NULL;
     }
@@ -234,14 +271,15 @@ siglip_model* siglip_load(const char* mmproj_path) {
 
 void siglip_free(siglip_model* m) {
     if (!m) return;
-    free(m->patch_w); free(m->patch_b); free(m->pos_w); free(m->post_ln_w); free(m->post_ln_b); free(m->fc_w);
+    free(m->patch_w); free(m->patch_b); free(m->pos_w); free(m->post_ln_w); free(m->post_ln_b); wt_free(m->fc_w);
     if (m->L) for (int l = 0; l < m->n_layers; l++) {
         free(m->L[l].ln1_w); free(m->L[l].ln1_b); free(m->L[l].ln2_w); free(m->L[l].ln2_b);
-        free(m->L[l].q_w); free(m->L[l].q_b); free(m->L[l].k_w); free(m->L[l].k_b);
-        free(m->L[l].v_w); free(m->L[l].v_b); free(m->L[l].o_w); free(m->L[l].o_b);
-        free(m->L[l].up_w); free(m->L[l].up_b); free(m->L[l].dn_w); free(m->L[l].dn_b);
+        wt_free(m->L[l].q_w); free(m->L[l].q_b); wt_free(m->L[l].k_w); free(m->L[l].k_b);
+        wt_free(m->L[l].v_w); free(m->L[l].v_b); wt_free(m->L[l].o_w); free(m->L[l].o_b);
+        wt_free(m->L[l].up_w); free(m->L[l].up_b); wt_free(m->L[l].dn_w); free(m->L[l].dn_b);
     }
     free(m->L); free(m);
+    free(g_vscratch); g_vscratch = NULL; g_vscap = 0;   /* reusable dequant scratch */
 }
 
 int siglip_n_patches(const siglip_model* m) { return m ? m->patches : 0; }
@@ -291,9 +329,9 @@ int siglip_encode(const siglip_model* m, const float* frame, float* out) {
         /* ── attention sublayer: x = x + Attn(LN1(x)) ── */
         memcpy(tmp, out, (long)P*D*sizeof(float));
         layernorm_rows(tmp, m->L[l].ln1_w, m->L[l].ln1_b, P, D, m->eps);
-        mmT(q, tmp, m->L[l].q_w, P, D, D); add_bias_rows(q, m->L[l].q_b, P, D);
-        mmT(k, tmp, m->L[l].k_w, P, D, D); add_bias_rows(k, m->L[l].k_b, P, D);
-        mmT(v, tmp, m->L[l].v_w, P, D, D); add_bias_rows(v, m->L[l].v_b, P, D);
+        mmT_w(q, tmp, m->L[l].q_w, P, D, D); add_bias_rows(q, m->L[l].q_b, P, D);
+        mmT_w(k, tmp, m->L[l].k_w, P, D, D); add_bias_rows(k, m->L[l].k_b, P, D);
+        mmT_w(v, tmp, m->L[l].v_w, P, D, D); add_bias_rows(v, m->L[l].v_b, P, D);
         for (int h = 0; h < H; h++) {
             int off = h*hd;
             for (int t = 0; t < P; t++) {
@@ -307,7 +345,7 @@ int siglip_encode(const siglip_model* m, const float* frame, float* out) {
             mm(oh, sc, vh, P, P, hd);                   /* oh[P,hd] = scores @ vh */
             for (int t = 0; t < P; t++) memcpy(att +(long)t*D+off, oh +(long)t*hd, hd*sizeof(float));
         }
-        mmT(proj, att, m->L[l].o_w, P, D, D); add_bias_rows(proj, m->L[l].o_b, P, D);
+        mmT_w(proj, att, m->L[l].o_w, P, D, D); add_bias_rows(proj, m->L[l].o_b, P, D);
         for (long i = 0; i < (long)P*D; i++) out[i] += proj[i];
 
         /* ── mlp sublayer: x = x + MLP(LN2(x)) ──
@@ -316,9 +354,9 @@ int siglip_encode(const siglip_model* m, const float* frame, float* out) {
          * (768->3072, out=3072) and ffn_up is fc2 (3072->768, out=768). */
         memcpy(tmp, out, (long)P*D*sizeof(float));
         layernorm_rows(tmp, m->L[l].ln2_w, m->L[l].ln2_b, P, D, m->eps);
-        mmT(up, tmp, m->L[l].dn_w, P, D, m->ffn); add_bias_rows(up, m->L[l].dn_b, P, m->ffn);   /* fc1: 768->3072 */
+        mmT_w(up, tmp, m->L[l].dn_w, P, D, m->ffn); add_bias_rows(up, m->L[l].dn_b, P, m->ffn);   /* fc1: 768->3072 */
         gelu_tanh_inplace(up, (long)P*m->ffn);
-        mmT(proj, up, m->L[l].up_w, P, m->ffn, D); add_bias_rows(proj, m->L[l].up_b, P, D);      /* fc2: 3072->768 */
+        mmT_w(proj, up, m->L[l].up_w, P, m->ffn, D); add_bias_rows(proj, m->L[l].up_b, P, D);      /* fc2: 3072->768 */
         for (long i = 0; i < (long)P*D; i++) out[i] += proj[i];
     }
 
@@ -361,7 +399,7 @@ int siglip_connect(const siglip_model* m, const float* hidden, float* out) {
                            hidden + (long)src * D, D * sizeof(float));
                 }
         }
-    mmT(out, sh, m->fc_w, n_vis, vis_dim, m->text_dim);   /* [64, text_dim] = sh @ fc^T */
+    mmT_w(out, sh, m->fc_w, n_vis, vis_dim, m->text_dim);   /* [64, text_dim] = sh @ fc^T */
     free(sh);
     return 0;
 }
