@@ -22,6 +22,7 @@
 #include <string.h>
 #include <math.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 
 #ifdef USE_BLAS
   #ifdef ACCELERATE
@@ -411,6 +412,7 @@ int main(int argc, char **argv) {
         int n_tok = bpe_encode(bpe, buf, toks, MS - img_max);
         free(buf);
         printf("image=%s  prompt=%d tok (vis=%d)\n", image_path, n_tok, NV);
+        double t_start = now_ms();
 
         kv_cache *kv = kv_new(model->n_layers, MS, model->kv_dim);
         float *logits = (float*)calloc(model->vocab, sizeof(float));
@@ -420,18 +422,30 @@ int main(int argc, char **argv) {
             if (toks[i] == 49190 && vis_slot < NV) ov = vemb + (long)(vis_slot++) * TD;  // splice
             llama_forward(model, kv, toks[i], i, logits, ov);
         }
+        double t_prompt = now_ms() - t_start;
         char piece[256];
+        int n_gen = 0;
         printf("OURS: \"");
         for (int step = 0; step < img_max; step++) {
             int next = argmax(logits, model->vocab);
             if (next == 2 || next == 49279) break;   // eos / <end_of_utterance>
             piece[0] = 0; bpe_decode_token(bpe, next, piece, sizeof(piece));
             printf("%s", piece); fflush(stdout);
+            n_gen++;
             int pos = n_tok + step;
             if (pos >= MS - 1) break;
             llama_forward(model, kv, next, pos, logits, NULL);
         }
         printf("\"\n");
+        /* the eye reports its own cost. Prompt and generation are timed apart:
+         * one number over both would call 84 prompt forwards a generation rate.
+         * ru_maxrss is bytes on macOS. */
+        double t_gen = now_ms() - t_start - t_prompt;
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        double rss_mb = (double)ru.ru_maxrss / (1024.0 * 1024.0);
+        printf("-- prompt %d tok in %.0f ms (%.1f tok/s) | gen %d tok in %.0f ms (%.1f tok/s) | peak RSS %.0f MB --\n",
+               n_tok, t_prompt, n_tok / (t_prompt / 1000.0),
+               n_gen, t_gen, n_gen > 0 ? n_gen / (t_gen / 1000.0) : 0.0, rss_mb);
         free(vemb); free(toks); free(logits); siglip_free(vm);
         bpe_free(bpe);   // gf already closed after llama_load
         return 0;
