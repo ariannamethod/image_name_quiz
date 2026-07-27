@@ -196,8 +196,8 @@ struct siglip_model {
         float *ln1_w,*ln1_b,*ln2_w,*ln2_b;
         wt q_w, k_w, v_w, o_w;     /* attn matmul weights (f16 in GGUF) */
         float *q_b,*k_b,*v_b,*o_b;
-        wt up_w, dn_w;             /* ffn matmul weights (f16 in GGUF) */
-        float *up_b,*dn_b;
+        wt fc1_w, fc2_w;           /* ffn matmul weights (f16 in GGUF), keyed by ROLE */
+        float *fc1_b,*fc2_b;
     } *L;
 };
 
@@ -205,6 +205,11 @@ static float* gd(gguf_file* gf, const char* name) {
     int ti = gguf_find_tensor(gf, name);
     if (ti < 0) return NULL;
     return gguf_dequant(gf, ti);
+}
+/* element count of a tensor as recorded in the file, or -1 if absent */
+static long tensor_nelem(gguf_file* gf, const char* name) {
+    int ti = gguf_find_tensor(gf, name);
+    return ti < 0 ? -1 : (long)gf->tensors[ti].n_elements;
 }
 static int kv_u32(gguf_file* gf, const char* key, int def) {
     const gguf_kv* kv = gguf_get_kv(gf, key);
@@ -255,14 +260,31 @@ siglip_model* siglip_load(const char* mmproj_path) {
         LW(k_w,"v.blk.%d.attn_k.weight"); LD(k_b,"v.blk.%d.attn_k.bias");
         LW(v_w,"v.blk.%d.attn_v.weight"); LD(v_b,"v.blk.%d.attn_v.bias");
         LW(o_w,"v.blk.%d.attn_out.weight"); LD(o_b,"v.blk.%d.attn_out.bias");
-        LW(up_w,"v.blk.%d.ffn_up.weight"); LD(up_b,"v.blk.%d.ffn_up.bias");
-        LW(dn_w,"v.blk.%d.ffn_down.weight"); LD(dn_b,"v.blk.%d.ffn_down.bias");
         #undef LD
         #undef LW
+        /* MLP by ROLE, not by name: converters disagree about which of ffn_up /
+         * ffn_down holds fc1. Ground truth is the bias length in the file —
+         * fc1 is hidden->ffn (bias == ffn), fc2 is ffn->hidden (bias == hidden).
+         * SmolVLM-256M's mmproj names fc1 "ffn_down"; SmolVLM2-500M's names it
+         * "ffn_up" (same SigLIP weights, mirrored names). */
+        snprintf(nm, sizeof(nm), "v.blk.%d.ffn_up.bias", l);
+        long ub = tensor_nelem(gf, nm);
+        if (ub != m->ffn && ub != m->hidden) {
+            fprintf(stderr, "siglip: layer %d ffn_up.bias has %ld elements, expected %d (fc1) or %d (fc2)\n",
+                    l, ub, m->ffn, m->hidden);
+            gguf_close(gf); siglip_free(m); return NULL;
+        }
+        const char *f1 = (ub == m->ffn) ? "ffn_up" : "ffn_down";
+        const char *f2 = (ub == m->ffn) ? "ffn_down" : "ffn_up";
+        snprintf(nm, sizeof(nm), "v.blk.%d.%s.weight", l, f1); m->L[l].fc1_w = load_wt(gf, nm);
+        snprintf(nm, sizeof(nm), "v.blk.%d.%s.bias",   l, f1); m->L[l].fc1_b = gd(gf, nm);
+        snprintf(nm, sizeof(nm), "v.blk.%d.%s.weight", l, f2); m->L[l].fc2_w = load_wt(gf, nm);
+        snprintf(nm, sizeof(nm), "v.blk.%d.%s.bias",   l, f2); m->L[l].fc2_b = gd(gf, nm);
     }
     gguf_close(gf);   /* dequant copied to float; raw gguf no longer needed */
 
-    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !wt_ok(m->L[0].q_w) || !wt_ok(m->fc_w)) {
+    if (!m->patch_w || !m->pos_w || !m->post_ln_w || !wt_ok(m->L[0].q_w) || !wt_ok(m->fc_w) ||
+        !wt_ok(m->L[0].fc1_w) || !wt_ok(m->L[0].fc2_w)) {
         fprintf(stderr, "siglip: missing critical vision weights\n");
         siglip_free(m); return NULL;
     }
@@ -276,7 +298,7 @@ void siglip_free(siglip_model* m) {
         free(m->L[l].ln1_w); free(m->L[l].ln1_b); free(m->L[l].ln2_w); free(m->L[l].ln2_b);
         wt_free(m->L[l].q_w); free(m->L[l].q_b); wt_free(m->L[l].k_w); free(m->L[l].k_b);
         wt_free(m->L[l].v_w); free(m->L[l].v_b); wt_free(m->L[l].o_w); free(m->L[l].o_b);
-        wt_free(m->L[l].up_w); free(m->L[l].up_b); wt_free(m->L[l].dn_w); free(m->L[l].dn_b);
+        wt_free(m->L[l].fc1_w); free(m->L[l].fc1_b); wt_free(m->L[l].fc2_w); free(m->L[l].fc2_b);
     }
     free(m->L); free(m);
     free(g_vscratch); g_vscratch = NULL; g_vscap = 0;   /* reusable dequant scratch */
@@ -349,14 +371,13 @@ int siglip_encode(const siglip_model* m, const float* frame, float* out) {
         for (long i = 0; i < (long)P*D; i++) out[i] += proj[i];
 
         /* ── mlp sublayer: x = x + MLP(LN2(x)) ──
-         * NOTE: this GGUF inverts the SigLIP MLP names. Ground truth = bias sizes
-         * in the file: ffn_up.bias=768, ffn_down.bias=3072. So ffn_down is fc1
-         * (768->3072, out=3072) and ffn_up is fc2 (3072->768, out=768). */
+         * fc1/fc2 were resolved by bias length at load time (see siglip_load),
+         * so both the mirrored 256M naming and the plain 500M one land here right. */
         memcpy(tmp, out, (long)P*D*sizeof(float));
         layernorm_rows(tmp, m->L[l].ln2_w, m->L[l].ln2_b, P, D, m->eps);
-        mmT_w(up, tmp, m->L[l].dn_w, P, D, m->ffn); add_bias_rows(up, m->L[l].dn_b, P, m->ffn);   /* fc1: 768->3072 */
+        mmT_w(up, tmp, m->L[l].fc1_w, P, D, m->ffn); add_bias_rows(up, m->L[l].fc1_b, P, m->ffn);  /* fc1: D->ffn */
         gelu_tanh_inplace(up, (long)P*m->ffn);
-        mmT_w(proj, up, m->L[l].up_w, P, m->ffn, D); add_bias_rows(proj, m->L[l].up_b, P, D);      /* fc2: 3072->768 */
+        mmT_w(proj, up, m->L[l].fc2_w, P, m->ffn, D); add_bias_rows(proj, m->L[l].fc2_b, P, D);    /* fc2: ffn->D */
         for (long i = 0; i < (long)P*D; i++) out[i] += proj[i];
     }
 
